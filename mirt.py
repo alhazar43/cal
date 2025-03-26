@@ -82,7 +82,7 @@ class MIRT(nn.Module):
         self.n_items = n_items
         self.n_dims = n_dims
         self.n_categories = n_categories
-        self.theta = nn.Parameter(torch.zeros(n_students, n_dims))
+        self.theta = nn.Parameter(torch.randn(n_students, n_dims))
         self.item_model = None
         self.history = None
     
