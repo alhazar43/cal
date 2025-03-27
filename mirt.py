@@ -3,11 +3,33 @@ import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
 
+class OnePLModel(nn.Module):
+    """
+    2PL Model: 2-Parameter Logistic Model
+    p_ij =  sigmoid(theta_i - b_j)
+    """
+    def __init__(self, n_items, n_dims):
+        super().__init__()
+        self.n_items = n_items
+        self.n_dims = n_dims
+        # self.a = nn.Parameter(torch.ones(n_items, n_dims))
+        self.b = nn.Parameter(torch.zeros(n_items))
+    
+    def forward(self, theta):
+        logits = theta - self.b.unsqueeze(0)
+        return torch.sigmoid(logits)
+    
+    def compute_loss(self, theta, responses):
+        prob = self(theta)
+        prob_clamped = torch.clamp(prob, 1e-6, 1-1e-6)
+        y = responses.float()
+        log_likelihood = y * torch.log(prob_clamped) + (1 - y) * torch.log(1 - prob_clamped)
+        return -log_likelihood.sum()
 
 class TwoPLModel(nn.Module):
     """
     2PL Model: 2-Parameter Logistic Model
-    p_ij = c_j + (1 - c_j) * sigmoid(a_j * (theta_i - b_j))
+    p_ij =  sigmoid(a_j * (theta_i - b_j))
     """
     def __init__(self, n_items, n_dims):
         super().__init__()
@@ -87,10 +109,13 @@ class MIRT(nn.Module):
         self.history = None
     
     def specify_model(self, model_type="2PL"):
+        
         if model_type == "2PL":
             self.item_model = TwoPLModel(self.n_items, self.n_dims)
         elif model_type == "GPCM":
             self.item_model = GPCMModel(self.n_items, self.n_dims, self.n_categories)
+        elif model_type == "1PL":
+            self.item_model = OnePLModel(self.n_items, self.n_dims)
         else:
             raise NotImplementedError(f"Model type '{model_type}' is not implemented.")
     
