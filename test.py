@@ -1,9 +1,11 @@
 import json
 import numpy as np
 import torch
+import os
 import torch.nn as nn
 import torch.optim as optim
 import pandas as pd
+from tqdm import tqdm
 import matplotlib.pyplot as plt
 
 
@@ -20,7 +22,7 @@ class AdaptiveTesting:
     3. Binary 0/1 (VCL items)
     """
     
-    def __init__(self, item_params_file, n_dims=2, init_theta=None, randomness=0.2):
+    def __init__(self, item_params_file, n_dims=2, init_theta=None, randomness=0.2, prior_weight=0.5):
         """
         Initialize the adaptive testing module.
         
@@ -29,9 +31,11 @@ class AdaptiveTesting:
             n_dims: Number of dimensions for the latent trait
             init_theta: Initial theta estimate (defaults to zeros)
             randomness: Probability of selecting a random item instead of most informative
+            prior_weight: Weight of the standard normal prior in theta estimation (higher = stronger regularization)
         """
         self.n_dims = n_dims
         self.randomness = randomness
+        self.prior_weight = prior_weight
         self.item_pool = self._load_item_params(item_params_file)
         self.available_items = list(range(len(self.item_pool)))
         self.administered_items = []
@@ -39,27 +43,26 @@ class AdaptiveTesting:
         self.info_gains = []
         self.theta_history = []
         
-        # Initialize theta
+        # Initialize theta as numpy array
         if init_theta is None:
             self.theta = np.zeros(n_dims)
         else:
-            self.theta = np.array(init_theta)
+            # Ensure initial theta is reasonable
+            init_theta = np.array(init_theta)
+            self.theta = np.clip(init_theta, -3.0, 3.0)
             
         # Track initial theta
         self.theta_history.append(self.theta.copy())
-            
-        # Convert theta to PyTorch tensor
-        self.theta_tensor = torch.tensor(self.theta, dtype=torch.float32).view(1, n_dims)
     
     def _load_item_params(self, item_params_file):
         """Load item parameters from JSON file."""
         with open(item_params_file, 'r') as f:
             item_pool = json.load(f)
         
-        # Convert parameters to PyTorch tensors
+        # Convert parameters to numpy arrays (we'll convert to tensors as needed)
         for item in item_pool:
-            item['a'] = torch.tensor(item['a'], dtype=torch.float32)
-            item['b'] = torch.tensor(item['b'], dtype=torch.float32)
+            item['a'] = np.array(item['a'], dtype=np.float32)
+            item['b'] = np.array(item['b'], dtype=np.float32)
         
         return item_pool
     
@@ -74,37 +77,55 @@ class AdaptiveTesting:
         else:
             return 'likert', 5  # 1-5 scale for RIASEC
     
-    def _compute_response_prob(self, item, theta):
-        """Compute response probabilities based on item type."""
-        item_type, n_categories = self._get_item_type_and_categories(item)
-        a = item['a']
-        b = item['b']
+    def _compute_2pl_prob(self, a, b, theta):
+        """
+        Compute binary item probability using 2PL model.
         
-        if item_type == 'binary':
-            # 2PL model
-            logit = torch.matmul(theta, a) - b[0]
-            return torch.sigmoid(logit)
-        else:
-            # GPCM model
-            score = torch.matmul(theta, a)
+        Args:
+            a: Discrimination parameter (numpy array)
+            b: Difficulty parameter (numpy array)
+            theta: Ability parameter (numpy array)
             
-            # Calculate scores for each category
-            scores = torch.zeros(n_categories, dtype=torch.float32)
+        Returns:
+            Probability of correct response (float)
+        """
+        # Convert to numpy for consistent calculations
+        logit = np.dot(theta, a) - b[0]
+        return 1.0 / (1.0 + np.exp(-logit))
+    
+    def _compute_gpcm_probs(self, a, b, theta, n_categories):
+        """
+        Compute category probabilities using GPCM model.
+        
+        Args:
+            a: Discrimination parameter (numpy array)
+            b: Step difficulty parameters (numpy array)
+            theta: Ability parameter (numpy array)
+            n_categories: Number of response categories
             
-            # First category (c=0) has score 0 (reference category)
-            scores[0] = 0.0
-            
-            # For categories c > 0, calculate cumulative score
-            for c in range(1, n_categories):
-                if c-1 < len(b):
-                    scores[c] = c * score - torch.sum(b[:c])
-            
-            # Apply softmax to get probabilities
-            max_score = torch.max(scores)
-            exp_scores = torch.exp(scores - max_score)  # Numerical stability
-            probs = exp_scores / torch.sum(exp_scores)
-            
-            return probs.squeeze()
+        Returns:
+            Probabilities for each category (numpy array)
+        """
+        # Calculate score
+        score = np.dot(theta, a)
+        
+        # Calculate scores for each category
+        scores = np.zeros(n_categories)
+        
+        # First category (c=0) has score 0 (reference category)
+        scores[0] = 0.0
+        
+        # For categories c > 0, calculate cumulative score
+        for c in range(1, n_categories):
+            if c-1 < len(b):
+                scores[c] = c * score - np.sum(b[:c])
+        
+        # Apply softmax to get probabilities
+        max_score = np.max(scores)
+        exp_scores = np.exp(scores - max_score)  # Numerical stability
+        probs = exp_scores / np.sum(exp_scores)
+        
+        return probs
     
     def _compute_item_information(self, item, theta):
         """Compute information gain for an item at current theta estimate."""
@@ -113,22 +134,22 @@ class AdaptiveTesting:
         
         if item_type == 'binary':
             # 2PL model information function
-            p = self._compute_response_prob(item, theta)
-            info = torch.sum((a**2) * p * (1 - p))
+            p = self._compute_2pl_prob(a, item['b'], theta)
+            info = np.sum((a**2) * p * (1 - p))
         
         elif item_type == 'likert':
             # Calculate probabilities for each category
-            probs = self._compute_response_prob(item, theta)
+            probs = self._compute_gpcm_probs(a, item['b'], theta, n_categories)
             
             # Calculate information using variance of expected score
-            categories = torch.arange(n_categories, dtype=torch.float32)
-            expected_c = torch.sum(categories * probs)
-            var_c = torch.sum(((categories - expected_c)**2) * probs)
+            categories = np.arange(n_categories)
+            expected_c = np.sum(categories * probs)
+            var_c = np.sum(((categories - expected_c)**2) * probs)
             
             # Information is weighted by squared discrimination
-            info = var_c * torch.sum(a**2)
+            info = var_c * np.sum(a**2)
         
-        return info.item()
+        return float(info)
     
     def select_next_item(self):
         """Select next item based on information gain with randomness."""
@@ -138,14 +159,14 @@ class AdaptiveTesting:
         # With probability 'randomness', select a random item
         if np.random.random() < self.randomness:
             next_item_idx = np.random.choice(self.available_items)
-            info_gain = self._compute_item_information(self.item_pool[next_item_idx], self.theta_tensor)
+            info_gain = self._compute_item_information(self.item_pool[next_item_idx], self.theta)
             return next_item_idx, info_gain
         
         # Calculate information for all available items
         infos = []
         for idx in self.available_items:
             item = self.item_pool[idx]
-            info = self._compute_item_information(item, self.theta_tensor)
+            info = self._compute_item_information(item, self.theta)
             infos.append(info)
         
         # Select the item with the highest information
@@ -155,57 +176,88 @@ class AdaptiveTesting:
         
         return next_item_idx, info_gain
     
-    def _compute_negative_log_likelihood(self, item, response, theta):
-        """Compute negative log-likelihood for a response to an item."""
-        item_type, _ = self._get_item_type_and_categories(item)
+    def _compute_neg_log_likelihood(self, theta_param):
+        """
+        Compute negative log-likelihood with prior for all administered items given theta.
         
-        if item_type == 'binary':
-            # 2PL model log-likelihood
-            p = self._compute_response_prob(item, theta)
-            p = torch.clamp(p, 1e-6, 1-1e-6)  # Numerical stability
+        Args:
+            theta_param: Theta parameter as a numpy array
             
-            if response == 1:
-                neg_log_likelihood = -torch.log(p)
-            else:
-                neg_log_likelihood = -torch.log(1 - p)
+        Returns:
+            Negative log-likelihood value with prior
+        """
+        neg_log_likelihood = 0.0
         
-        elif item_type == 'likert':
-            # GPCM model log-likelihood
-            probs = self._compute_response_prob(item, theta)
-            probs = torch.clamp(probs, 1e-6, 1.0)  # Numerical stability
+        for item_idx, response in zip(self.administered_items, self.responses):
+            item = self.item_pool[item_idx]
+            item_type, n_categories = self._get_item_type_and_categories(item)
             
-            # Convert response to 0-based index for indexing into probs
-            response_idx = response - 1 if item_type == 'likert' else response
+            if item_type == 'binary':
+                # 2PL model log-likelihood
+                p = self._compute_2pl_prob(item['a'], item['b'], theta_param)
+                p = np.clip(p, 1e-6, 1-1e-6)  # Numerical stability
+                
+                if response == 1:
+                    neg_log_likelihood -= np.log(p)
+                else:
+                    neg_log_likelihood -= np.log(1 - p)
             
-            # Return negative log-likelihood for the selected category
-            neg_log_likelihood = -torch.log(probs[response_idx])
+            elif item_type == 'likert':
+                # GPCM model log-likelihood
+                probs = self._compute_gpcm_probs(item['a'], item['b'], theta_param, n_categories)
+                probs = np.clip(probs, 1e-6, 1.0)  # Numerical stability
+                
+                # Convert response to 0-based index for indexing into probs
+                response_idx = response - 1 if item_type == 'likert' else response
+                
+                # Add negative log-likelihood for the selected category
+                neg_log_likelihood -= np.log(probs[response_idx])
         
-        return neg_log_likelihood
+        # Add standard normal prior (regularization term)
+        # This encourages theta to stay close to standard normal distribution
+        prior_penalty = self.prior_weight * np.sum(theta_param**2)
+        
+        return neg_log_likelihood + prior_penalty
     
-    def _estimate_theta(self, n_iterations=50, lr=0.05):
-
-        # Initialize theta as parameter to optimize
-        theta_param = nn.Parameter(self.theta_tensor.clone())
-        optimizer = optim.Adam([theta_param], lr=lr)
+    def _estimate_theta(self, n_iterations=100):
+        """
+        Estimate theta using maximum a posteriori (MAP) estimation with constraints.
+        """
+        # If no items have been administered yet, return initial theta
+        if not self.administered_items:
+            return
         
-        # Optimize for n iterations
-        for _ in range(n_iterations):
-            optimizer.zero_grad()
-            
-            # Compute negative log-likelihood
-            neg_log_likelihood = 0
-            for item_idx, response in zip(self.administered_items, self.responses):
-                item = self.item_pool[item_idx]
-                neg_log_likelihood += self._compute_negative_log_likelihood(item, response, theta_param)
-            
-            neg_log_likelihood.backward()
-            optimizer.step()
+        # Use scipy's minimize function for optimization
+        from scipy.optimize import minimize
         
-        # Update theta
-        self.theta_tensor = theta_param.detach().clone()
-        self.theta = self.theta_tensor.squeeze().numpy()
+        # Define objective function for minimization
+        def objective(theta_flat):
+            theta_reshaped = theta_flat.reshape(self.n_dims)
+            return self._compute_neg_log_likelihood(theta_reshaped)
+        
+        # Set bounds to keep theta within reasonable range (-4 to 4)
+        # This is approximately 99.99% of the standard normal distribution
+        bounds = [(-4.0, 4.0) for _ in range(self.n_dims)]
+        
+        # Initialize with current theta and optimize
+        initial_theta_flat = self.theta.flatten()
+        
+        # Ensure initial values are within bounds
+        initial_theta_flat = np.clip(initial_theta_flat, -4.0, 4.0)
+        
+        # Use L-BFGS-B method which supports bounds
+        result = minimize(
+            objective, 
+            initial_theta_flat, 
+            method='L-BFGS-B',
+            bounds=bounds
+        )
+        
+        # Update theta with the result
+        self.theta = result.x.reshape(self.n_dims)
     
     def update_theta(self, item_idx, response):
+        """Update theta estimate based on the response to an item."""
         # Validate response
         item = self.item_pool[item_idx]
         item_type, n_categories = self._get_item_type_and_categories(item)
@@ -219,7 +271,7 @@ class AdaptiveTesting:
                 raise ValueError(f"Likert response must be in range {valid_range}, got {response}")
         
         # Calculate information gain
-        info_gain = self._compute_item_information(item, self.theta_tensor)
+        info_gain = self._compute_item_information(item, self.theta)
         
         # Add the administered item and response to the history
         self.administered_items.append(item_idx)
@@ -239,6 +291,7 @@ class AdaptiveTesting:
         return self.theta.copy(), info_gain
     
     def get_results_dataframe(self):
+        """Get results as a pandas DataFrame in the specified format."""
         rows = []
         
         for i, (item_idx, response, info_gain) in enumerate(zip(
@@ -248,7 +301,7 @@ class AdaptiveTesting:
             item = self.item_pool[item_idx]
             item_type, _ = self._get_item_type_and_categories(item)
             
-
+            # Create administered_item dict with relevant info
             administered_item = {
                 'item_id': item_idx,
                 'type': item_type,
@@ -335,25 +388,50 @@ class AdaptiveTesting:
             
             # Update theta
             self.update_theta(item_idx, response)
+            
+            if verbose:
+                print(f"Item {i+1}: {item['item_name']}, Response: {response}, "
+                      f"Theta: {self.theta}")
         
         # Return results
         return self.get_results_dataframe()
 
 
 def run_adaptive_test_simulation(params_file, n_items=10, n_dims=2, init_theta=None, 
-                               randomness=0.2, responses=None, verbose=False, plot=True,
-                               plot_save_path=None):
-
+                               randomness=0.2, prior_weight=0.5, responses=None, verbose=False, 
+                               plot=True, plot_save_path=None):
+    """
+    Run an adaptive test simulation with specified parameters.
+    
+    Args:
+        params_file: Path to item parameters file
+        n_items: Maximum number of items to administer
+        n_dims: Number of dimensions for latent trait
+        init_theta: Initial theta estimate (defaults to zeros)
+        randomness: Probability of selecting a random item
+        responses: Pre-determined responses for simulation
+        verbose: Whether to print progress information
+        plot: Whether to plot theta trajectory
+        plot_save_path: Path to save the plot
+        
+    Returns:
+        results_df: DataFrame with test results
+        fig: Matplotlib figure of theta trajectory (if plot=True)
+        adaptive_test: Testing object for further analysis
+    """
+    # Initialize adaptive test
     adaptive_test = AdaptiveTesting(
         params_file, 
         n_dims=n_dims, 
         init_theta=init_theta, 
-        randomness=randomness
+        randomness=randomness,
+        prior_weight=prior_weight
     )
     
-
+    # Run the test
     results_df = adaptive_test.run_test(n_items=n_items, responses=responses, verbose=verbose)
-
+    
+    # Plot theta trajectory
     fig = None
     if plot:
         fig = adaptive_test.plot_theta_history(save_path=plot_save_path)
@@ -362,17 +440,26 @@ def run_adaptive_test_simulation(params_file, n_items=10, n_dims=2, init_theta=N
 
 
 if __name__ == "__main__":
-
-    results_df, fig, test = run_adaptive_test_simulation(
-        params_file='combined_params.json',
-        n_items=20,
-        n_dims=2,
-        init_theta=np.random.normal(0, 1, 2),  
-        randomness=0.1,          
-        verbose=False,
-        plot=True,
-        plot_save_path='theta_plot.png'
-    )
+    # Example: Run an adaptive test simulation with specific parameters
+    fig_dir = 'figures'
+    res_dir = 'results'
+    if not os.path.exists(fig_dir):
+        os.makedirs(fig_dir)
+    if not os.path.exists(res_dir):
+        os.makedirs(res_dir)
+        
+    for i in tqdm(range(20)):
+        results_df, fig, test = run_adaptive_test_simulation(
+            params_file='combined_params.json',
+            n_items=20,
+            n_dims=2,
+            init_theta=np.random.randn(2),  # Starting with a non-zero initial theta
+            randomness=0.1,          # 30% chance of selecting a random item
+            prior_weight=0.2,        # Stronger regularization to ensure standard normal distribution
+            verbose=False,
+            plot=True
+        )
     
-    # Display the results table
-    results_df.to_csv('adaptive_test_results.csv', index=False)
+        
+        results_df.to_csv(os.path.join(res_dir, f'atr_{i}.csv'), index=False)
+        fig.savefig(os.path.join(fig_dir, f'theta_trace_{i}.png'))

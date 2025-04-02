@@ -109,13 +109,12 @@ class MIRT(nn.Module):
         self.history = None
     
     def specify_model(self, model_type="2PL"):
-        
-        if model_type == "2PL":
+        if model_type == "1PL":
+            self.item_model = OnePLModel(self.n_items, self.n_dims)
+        elif model_type == "2PL":
             self.item_model = TwoPLModel(self.n_items, self.n_dims)
         elif model_type == "GPCM":
             self.item_model = GPCMModel(self.n_items, self.n_dims, self.n_categories)
-        elif model_type == "1PL":
-            self.item_model = OnePLModel(self.n_items, self.n_dims)
         else:
             raise NotImplementedError(f"Model type '{model_type}' is not implemented.")
     
@@ -170,7 +169,9 @@ class JointMIRT(MIRT):
             n_items (int): Number of items for this model.
             n_categories (int, optional): Number of categories (required for GPCM).
         """
-        if model_type == "2PL":
+        if model_type == "1PL":
+            model = OnePLModel(n_items, self.n_dims)
+        elif model_type == "2PL":
             model = TwoPLModel(n_items, self.n_dims)
         elif model_type == "GPCM":
             if n_categories is None:
