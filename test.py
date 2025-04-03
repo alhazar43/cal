@@ -391,7 +391,9 @@ if __name__ == "__main__":
             plot=True,
             plot_save_path=fig_path
         )
-        fig.savefig(fig_path)
+        if fig:
+            fig.savefig(fig_path, dpi=300)
+            plt.close(fig)
         # Save results
         with open(os.path.join(res_dir, f'atr_{i}.pkl'), 'wb') as f:
             pickle.dump(results_dict, f)
