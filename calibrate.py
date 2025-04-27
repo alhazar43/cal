@@ -58,5 +58,39 @@ def riasec_items(filename='data.csv', n_dims=2, n_epochs=1000, lr=0.01):
     })
     combined.to_csv('combined_params_{}d.csv'.format(n_dims), index=False)
     
+
+    
+def big5_items(filename='big5.csv', n_dims=2, n_epochs=1000, lr=0.01):
+    df = pd.read_csv(filename, low_memory=False)
+    big5_df = df.iloc[:, 7:]
+    
+    big5_df.replace(0,1,inplace=True)
+
+    n_students = big5_df.shape[0]
+    n_big5_items = big5_df.shape[1]
+    n_big5_categories = 5
+
+    
+    combined_responses = [big5_df.values-1]
+    
+    jmirt = JointMIRT(n_students, n_dims=n_dims)
+    jmirt.add_model("GPCM", n_big5_items, 5)
+
+    
+    jmirt.fit(combined_responses, n_epochs=n_epochs, lr=lr)
+    
+    big5_a = jmirt.item_models[0].a.detach().numpy()
+    big5_b = jmirt.item_models[0].b.detach().numpy()
+
+    
+    big5_columns = [f"a{i+1}" for i in range(n_dims)] + [f"b{j+1}" for j in range(n_big5_categories-1)]
+
+    big5_prarms = pd.DataFrame(np.concatenate([big5_a, big5_b], axis=1), columns=big5_columns)
+
+
+    big5_prarms.to_csv('big5_params_{}d.csv'.format(n_dims), index=False)
+    
+    
 if __name__ == '__main__':
-    riasec_items(n_epochs=500, n_dims=2, lr=0.01)
+    # riasec_items(n_epochs=500, n_dims=2, lr=0.01)
+    big5_items(n_epochs=500, n_dims=2, lr=0.01)

@@ -376,13 +376,14 @@ if __name__ == "__main__":
     os.makedirs(fig_dir, exist_ok=True)
     os.makedirs(res_dir, exist_ok=True)
         
-    for i in tqdm(range(20)):
+    for i in tqdm(range(50)):
         fig_path = os.path.join(fig_dir, f'theta_trace_{i}.png')
         
         
         results_df, results_dict, fig, test = run_adaptive_test_simulation(
-            params_file='combined_params.json',
-            n_items=25,
+            # params_file='combined_params.json',
+            params_file='data_final.json',
+            n_items=30,
             n_dims=2,
             init_theta=np.random.normal(0, 1, 2),
             randomness=0.05,
